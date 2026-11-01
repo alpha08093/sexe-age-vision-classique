@@ -6,6 +6,7 @@ import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 from skimage.feature import hog, local_binary_pattern
 
+
 # ZeroGPU (Hugging Face) exige au moins une fonction décorée @spaces.GPU.
 # Notre application n'utilise pas de GPU : tout le calcul se fait sur CPU, cette fonction n'est jamais appelée.
 try:
