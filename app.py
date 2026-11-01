@@ -2,33 +2,43 @@ import os
 import numpy as np
 import cv2
 import joblib
-import gradio as gr
+import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from skimage.feature import hog, local_binary_pattern
 
+st.set_page_config(page_title="Sexe et âge — Vision classique", page_icon="🧑", layout="wide")
 
-# ZeroGPU (Hugging Face) exige au moins une fonction décorée @spaces.GPU.
-# Notre application n'utilise pas de GPU : tout le calcul se fait sur CPU, cette fonction n'est jamais appelée.
-try:
-    import spaces
+# Empêche la traduction automatique du navigateur (Google Traduction), qui fait planter l'interface Streamlit
+st.iframe(
+    """<script>
+        const doc = window.parent.document;
+        doc.documentElement.setAttribute("lang", "fr");
+        doc.documentElement.setAttribute("translate", "no");
+        doc.documentElement.classList.add("notranslate");
+        if (!doc.querySelector('meta[name="google"]')) {
+            const meta = doc.createElement("meta");
+            meta.name = "google";
+            meta.content = "notranslate";
+            doc.head.appendChild(meta);
+        }
+    </script>""",
+    height=1,
+)
 
-    @spaces.GPU
-    def _fonction_gpu_non_utilisee():
-        return None
-except ImportError:
-    pass  # en dehors de Hugging Face (Colab, local), le module "spaces" n'existe pas : on ignore
-    
-# ---------- Chargement des modèles et des paramètres ----------
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
-donnees = joblib.load(os.path.join(DOSSIER, "modeles_visages.joblib"))
-MODELE_SEXE, MODELE_AGE = donnees["sexe"], donnees["age"]
-CALIB = donnees["calibration"]
-CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml")
-POLICE = os.path.join(DOSSIER, "DejaVuSans.ttf")
 
 NOMS = {("Male", "Enfant"): "Garçon", ("Female", "Enfant"): "Fille",
         ("Male", "Adulte"): "Homme", ("Female", "Adulte"): "Femme",
         ("Male", "Âgé"): "Vieil homme", ("Female", "Âgé"): "Vieille femme"}
+
+# ---------- Chargement unique des modèles (mis en cache par Streamlit) ----------
+@st.cache_resource
+def charger():
+    donnees = joblib.load(os.path.join(DOSSIER, "modeles_visages.joblib"))
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml")
+    return donnees["sexe"], donnees["age"], donnees["calibration"], cascade
+
+MODELE_SEXE, MODELE_AGE, CALIB, CASCADE = charger()
 
 # ---------- 1. Recadrage calibré (même cadrage qu'UTKFace) ----------
 def recadrer(img, boite):
@@ -87,15 +97,10 @@ def caracteristiques(img, masque):
     return np.hstack([f_hog, np.concatenate(f_lbp), np.concatenate(f_col)]).reshape(1, -1)
 
 # ---------- 4. Analyse complète d'une photo ----------
-def analyser(image):
-    if image is None:
-        return None, [], "Veuillez déposer une photo ou utiliser la webcam."
-    img = np.ascontiguousarray(image[..., :3]).astype(np.uint8)
-    # Les grandes photos sont réduites pour accélérer l'analyse
-    echelle = 1000 / max(img.shape[:2])
+def analyser(img):
+    echelle = 1000 / max(img.shape[:2])                 # les grandes photos sont réduites
     if echelle < 1:
         img = cv2.resize(img, None, fx=echelle, fy=echelle)
-
     gris = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY))
     boites = CASCADE.detectMultiScale(gris, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30))
     aucun_visage = len(boites) == 0
@@ -104,10 +109,8 @@ def analyser(image):
 
     annotee = Image.fromarray(img.copy())
     dessin = ImageDraw.Draw(annotee)
-    police = ImageFont.truetype(POLICE, size=max(14, img.shape[1] // 40))
-    galerie = []
-    lignes = ["| Visage | Catégorie | Confiance sexe | Confiance âge |", "|---|---|---|---|"]
-
+    police = ImageFont.truetype(os.path.join(DOSSIER, "DejaVuSans.ttf"), size=max(14, img.shape[1] // 40))
+    resultats = []
     for k, (x, y, bw, bh) in enumerate(sorted(boites, key=lambda b: b[0]), start=1):
         visage = cv2.resize(img, (100, 100)) if aucun_visage else recadrer(img, (x, y, bw, bh))
         masque = segmenter(visage)
@@ -120,33 +123,48 @@ def analyser(image):
         g, h_, d, b = dessin.textbbox((x, y + bh + 4), texte, font=police)
         dessin.rectangle([g - 3, h_ - 2, d + 3, b + 2], fill=(0, 120, 0))
         dessin.text((x, y + bh + 4), texte, fill=(255, 255, 255), font=police)
+        resultats.append({"visage": visage, "segmente": cv2.bitwise_and(visage, visage, mask=masque),
+                          "categorie": categorie, "conf_sexe": p_sexe.max(), "conf_age": p_age.max()})
+    return np.array(annotee), resultats, aucun_visage
 
-        galerie.append((cv2.resize(visage, (200, 200)), f"Visage {k} : recadré"))
-        galerie.append((cv2.resize(cv2.bitwise_and(visage, visage, mask=masque), (200, 200)), f"Visage {k} : segmenté"))
-        lignes.append(f"| {k} | **{categorie}** | {100 * p_sexe.max():.0f} % | {100 * p_age.max():.0f} % |")
+# ---------- 5. Interface Streamlit ----------
+st.title("Fille, garçon, femme, homme, vieille femme ou vieil homme ?")
+st.markdown("Classification du **sexe** et de la **tranche d'âge** par méthodes **classiques** de vision par ordinateur : "
+            "détection de Haar (Viola-Jones) → segmentation GrabCut → descripteurs HOG, LBP et couleur → SVM.  \n"
+            "*Projet du cours de Computer Vision — SUP'RH.*")
 
-    resume = "\n".join(lignes)
+source = st.radio("Source de la photo", ["📁 Déposer une photo", "📷 Webcam"], horizontal=True)
+if source == "📁 Déposer une photo":
+    fichier = st.file_uploader("Choisir une photo", type=["jpg", "jpeg", "png", "webp"])
+else:
+    fichier = st.camera_input("Prendre une photo")
+
+if fichier is not None:
+    image = np.array(Image.open(fichier).convert("RGB"))
+    with st.spinner("Analyse en cours…"):
+        annotee, resultats, aucun_visage = analyser(image)
+
     if aucun_visage:
-        resume = "⚠️ Aucun visage détecté : la photo entière a été analysée comme un visage.\n\n" + resume
-    return np.array(annotee), galerie, resume
+        st.warning("Aucun visage détecté : la photo entière a été analysée comme un visage.")
 
-# ---------- 5. Interface Gradio ----------
-demo = gr.Interface(
-    fn=analyser,
-    inputs=gr.Image(type="numpy", sources=["upload", "webcam"], label="Photo"),
-    outputs=[gr.Image(label="Résultat"),
-             gr.Gallery(label="Visages recadrés et segmentés", columns=4, height="auto"),
-             gr.Markdown(label="Récapitulatif")],
-    title="Fille, garçon, femme, homme, vieille femme ou vieil homme ?",
-    description=("Classification du **sexe** et de la **tranche d'âge** par méthodes **classiques** de vision par ordinateur : "
-                 "détection de Haar (Viola-Jones) → segmentation GrabCut → descripteurs HOG, LBP et couleur → SVM. "
-                 "Projet du cours de Computer Vision — SUP'RH."),
-    article=("**Limites :** le modèle prédit une *apparence perçue* à partir d'annotations binaires du dataset UTKFace. "
-             "Il ne détermine ni l'identité de genre ni l'âge réel, et ses performances peuvent varier selon les personnes "
-             "(≈ 80 % pour le sexe, ≈ 84 % pour la tranche d'âge). Les photos sont traitées en mémoire et ne sont pas "
-             "conservées par l'application."),
-    flagging_mode="never",
-)
+    col1, col2 = st.columns(2)
+    col1.image(image, caption="Photo d'origine", width="stretch")
+    col2.image(annotee, caption="Résultat", width="stretch")
 
-if __name__ == "__main__":
-    demo.launch()
+    st.subheader("Récapitulatif")
+    lignes = ["| Visage | Catégorie | Confiance sexe | Confiance âge |", "|---|---|---|---|"]
+    for k, r in enumerate(resultats, start=1):
+        lignes.append(f"| {k} | **{r['categorie']}** | {100 * r['conf_sexe']:.0f} % | {100 * r['conf_age']:.0f} % |")
+    st.markdown("\n".join(lignes))
+
+    st.subheader("Visages recadrés et segmentés")
+    colonnes = st.columns(min(4, 2 * len(resultats)))
+    for k, r in enumerate(resultats):
+        colonnes[(2 * k) % len(colonnes)].image(cv2.resize(r["visage"], (200, 200)), caption=f"Visage {k + 1} : recadré")
+        colonnes[(2 * k + 1) % len(colonnes)].image(cv2.resize(r["segmente"], (200, 200)), caption=f"Visage {k + 1} : segmenté")
+
+st.divider()
+st.caption("**Limites :** le modèle prédit une *apparence perçue* à partir d'annotations binaires du dataset UTKFace. "
+           "Il ne détermine ni l'identité de genre ni l'âge réel, et ses performances peuvent varier selon les personnes "
+           "(≈ 80 % pour le sexe, ≈ 84 % pour la tranche d'âge). Les photos sont traitées en mémoire et ne sont pas "
+           "conservées par l'application.")
